@@ -2,7 +2,7 @@
 
 # how we got the last firefox sources
 
-wget "https://ftp.mozilla.org/pub/mozilla.org/firefox/releases/38.3.0esr/source/firefox-38.3.0esr.source.tar.bz2"
+wget --no-check-certificate "https://ftp.mozilla.org/pub/mozilla.org/firefox/releases/38.3.0esr/source/firefox-38.3.0esr.source.tar.bz2"
 
 tar -jxf firefox-38.3.0esr.source.tar.bz2
 
