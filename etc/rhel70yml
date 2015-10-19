@@ -1,0 +1,2136 @@
+#####################################################
+#               A note on expansions                #
+#####################################################
+
+# Expansions usually appear in the form ${key|default}
+# If 'key' is found in the executor's map of currently known
+# expansions, the corresponding value is used. If the key can
+# not be found, the default is used.
+#
+# Arbitrary expansions can be specified in the YAML cofiguration
+# files in the following places:
+# - The 'expansions' field for buildvariants (branch file)
+# - The 'expansions' field for distros (distros file)
+#
+# A number of 'built-in' expansions are also available for use; these include:
+# - environment variables available on the host machine
+# - 'workdir' (references the executor's work directory).
+# - 'task_id' (references the task id of the task the executor is working on).
+# - 'build_variant' (references the executing task's buildvariant).
+# - 'config_root' (references the root directory for the executor's configuration artifacts).
+
+user: "admin"
+api_key: "f7d9e4387a80283880b7a01c9512adc5"
+api_server_host: "http://soe05x-vm1.aus.stglabs.ibm.com:8080/api"
+ui_server_host: "http://soe05x-vm1.aus.stglabs.ibm.com:9090"
+
+stepback: true
+command_type: system
+
+## Some variables for convenience:
+variables:
+
+# Used for tests that invoke resmoke.py and require no additional setup.
+- &task_template
+  name: template
+  depends_on:
+  - name: compile
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --help
+      run_multiple_jobs: false
+      max_jobs: 0  # If set in combination with run_multiple_jobs, will cap the number of jobs used.
+
+- &debug_symbol_variants
+  - rhel70
+
+- &packaging_variants
+  - rhel70
+
+- &MAX_PRIORITY
+  priority: 2147483647 # special case to make sure compiles aren't blocked in patches
+
+#######################################
+#            Functions                #
+#######################################
+
+functions:
+
+  "fetch artifacts" : &fetch_artifacts
+    command: s3.get
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/artifacts/${build_id}.tgz
+      bucket: mciuploads
+      extract_to: src
+
+  "fetch binaries" : &fetch_binaries
+    command: s3.get
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/binaries/mongo-${build_id}.${ext|tgz}
+      bucket: mciuploads
+      local_file: src/mongo-binaries.tgz
+
+  "extract binaries" : &extract_binaries
+    command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        ${decompress|unzip} mongo-binaries.tgz
+
+  "get buildnumber" : &get_buildnumber
+    command: keyval.inc
+    params:
+      key: "${build_variant}_master"
+      destination: "builder_num"
+
+  "setup credentials" : &setup_credentials
+    command: shell.exec
+    params:
+      working_dir: src
+      silent: true
+      script: |
+        cat > mci.buildlogger <<END_OF_CREDS
+        slavename='${slave}'
+        passwd='${passwd}'
+        builder='MCI_${build_variant}'
+        build_num=${builder_num}
+        build_phase='${task_name}_${execution}'
+        END_OF_CREDS
+
+  "upload debugsymbols" :
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/mongo-debugsymbols.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/debugsymbols/debugsymbols-${build_id}.${ext|tgz}
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      build_variants:
+        *debug_symbol_variants
+
+  "fetch debugsymbols archive" :
+    command: s3.get
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/debugsymbols/debugsymbols-${build_id}.${ext|tgz}
+      bucket: mciuploads
+      local_file: src/mongo-debugsymbols.tgz
+      build_variants:
+        *debug_symbol_variants
+
+  "build rocksdb" :
+    command: shell.exec
+    params:
+      script: |
+        set -o errexit
+        set -o verbose
+        if [ "${build_rocksdb|}" = "true" ]; then
+        rm -rf rocksdb
+        git clone https://github.com/facebook/rocksdb.git
+        cd rocksdb
+        make static_lib
+        fi
+
+  "build new tools" :
+    command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        set -o verbose
+
+        # create the target directory for the binaries
+        mkdir -p src/mongo-tools
+
+        # clone into a different path so the binaries and package directory
+        # names do not conflict
+        ${gitvars} git clone https://github.com/mongodb/mongo-tools.git src/mongo-tools-repo
+        cd src/mongo-tools-repo
+
+        # make sure newlines in the scripts are handled correctly by windows
+        if [ "Windows_NT" = "$OS" ]; then
+            set -o igncr
+        fi;
+
+        git checkout r3.2.0-rc0
+        . ./${set_tools_gopath|set_gopath.sh}
+
+        # In RHEL 5.5, /usr/bin/ld can't handle --build-id parameters, so
+        # use a wrapper if it's present on the system
+        #
+        if [ -d /opt/ldwrapper/bin ]
+        then
+          export PATH=/opt/ldwrapper/bin:$PATH
+        fi
+
+        for i in bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog; do
+             ${gorootvars} go build -ldflags "-X github.com/mongodb/mongo-tools/common/options.Gitspec $(git rev-parse HEAD)" ${tooltags|} -o "../mongo-tools/$i${exe|}" $i/main/$i.go
+             echo $i;
+        done
+        exit 0
+
+  "do setup" :
+  - *fetch_artifacts
+  - *fetch_binaries
+  - *extract_binaries
+  - *get_buildnumber
+  - *setup_credentials
+
+  "set up virtualenv" :
+    command: shell.exec
+    type: test
+    params:
+        working_dir: src
+        script: |
+          # exit immediately if virtualenv is not found
+          set -o errexit
+          set -o verbose
+          virtualenv --system-site-packages ./venv
+
+  "run tests" :
+    command: shell.exec
+    type: test
+    params:
+      working_dir: src
+      script: |
+        set -o errexit
+        set -o verbose
+
+        # check if virtualenv is set up
+        if [ -d "venv" ]; then
+          if [ "Windows_NT" = "$OS" ]; then
+            . ./venv/Scripts/activate
+          else
+            . ./venv/bin/activate
+          fi
+        fi
+
+        cp mongodb*/bin/* .
+        if [ ${run_multiple_jobs|false} = true ]; then
+          if [ ${max_jobs|0} -gt 0 ] && [ ${max_jobs|0} -lt ${num_jobs_available|1} ]; then
+              ${asan_symbolizer} ${enable_lsan} ${rlp_environment} ${python|python} buildscripts/resmoke.py ${resmoke_args} --jobs=${max_jobs} --shuffle ${test_flags} --log=buildlogger --reportFile=report.json
+          else
+              ${asan_symbolizer} ${enable_lsan} ${rlp_environment} ${python|python} buildscripts/resmoke.py ${resmoke_args} --jobs=${num_jobs_available|1} --shuffle ${test_flags} --log=buildlogger --reportFile=report.json
+          fi
+        else
+          ${asan_symbolizer} ${enable_lsan} ${rlp_environment} ${python|python} buildscripts/resmoke.py ${resmoke_args} --jobs=1 --shuffle ${test_flags} --log=buildlogger --reportFile=report.json
+        fi
+
+  "setup release credentials":
+    command: shell.exec
+    params:
+      silent: true
+      script: |
+        cat <<EOF > ~/.mongodb-jira.yaml
+        jira:
+          username: ${release_jira_username}
+          password: ${release_jira_password}
+          url: https://jira.mongodb.org/
+        EOF
+
+  "cleanup release credentials":
+    command: shell.exec
+    params:
+      script: |
+        rm -f ~/.mongodb-jira.yaml
+
+  "clone kernel-tools repo":
+    command: shell.exec
+    params:
+      script: |
+        git clone git@github.com:10gen/kernel-tools.git
+
+  "setup kernel-tools virtualenv":
+    command: shell.exec
+    params:
+      script: |
+        set -o errexit
+        set -o verbose
+
+        cd kernel-tools/releases/release_tickets/
+        virtualenv --system-site-packages venv-release
+        . venv-release/bin/activate
+        pip install --retries 30 --timeout 30 jira==0.16 requests==2.7.0
+
+pre:
+  - command: shell.track
+  - command: shell.exec
+    params:
+      silent: true
+      script: |
+        ${killall_mci|pkill -9 mongod; pkill -9 mongos; pkill -9 mongo; pkill -9 bsondump; pkill -9 mongoimport; pkill -9 mongoexport; pkill -9 mongodump; pkill -9 mongorestore; pkill -9 mongostat; pkill -9 mongofiles; pkill -9 mongooplog; pkill -9 mongotop; pkill -9 mongobridge; pkill -9 mongod-2.6; pkill -9 mongos-2.6; pkill -9 mongo-2.6; pkill -9 bsondump-2.6; pkill -9 mongoimport-2.6; pkill -9 mongoexport-2.6; pkill -9 mongodump-2.6; pkill -9 mongorestore-2.6; pkill -9 mongostat-2.6; pkill -9 mongofiles-2.6; pkill -9 mongooplog-2.6; pkill -9 mongotop-2.6; pkill -9 mongobridge-2.6; pkill -9 mongod-2.4; pkill -9 mongos-2.4; pkill -9 mongo-2.4; pkill -9 bsondump-2.4; pkill -9 mongoimport-2.4; pkill -9 mongoexport-2.4; pkill -9 mongodump-2.4; pkill -9 mongorestore-2.4; pkill -9 mongostat-2.4; pkill -9 mongofiles-2.4; pkill -9 mongooplog-2.4; pkill -9 mongotop-2.4; pkill -9 resmoke.py; pkill -9 python; pkill -9 cl; pkill -9 lldb; pkill -9 _test} >/dev/null 2>&1
+        rm -rf src /data/db/* mongo-coredumps.tgz
+        exit 0
+
+post:
+  - command: attach.results
+    params:
+      file_location: src/report.json
+  - command: shell.exec
+    params:
+      silent: true
+      script: |
+        ${killall_mci|pkill -9 mongod; pkill -9 mongos; pkill -9 mongo; pkill -9 bsondump; pkill -9 mongoimport; pkill -9 mongoexport; pkill -9 mongodump; pkill -9 mongorestore; pkill -9 mongostat; pkill -9 mongofiles; pkill -9 mongooplog; pkill -9 mongotop; pkill -9 mongobridge; pkill -9 mongod-2.6; pkill -9 mongos-2.6; pkill -9 mongo-2.6; pkill -9 bsondump-2.6; pkill -9 mongoimport-2.6; pkill -9 mongoexport-2.6; pkill -9 mongodump-2.6; pkill -9 mongorestore-2.6; pkill -9 mongostat-2.6; pkill -9 mongofiles-2.6; pkill -9 mongooplog-2.6; pkill -9 mongotop-2.6; pkill -9 mongobridge-2.6; pkill -9 mongod-2.4; pkill -9 mongos-2.4; pkill -9 mongo-2.4; pkill -9 bsondump-2.4; pkill -9 mongoimport-2.4; pkill -9 mongoexport-2.4; pkill -9 mongodump-2.4; pkill -9 mongorestore-2.4; pkill -9 mongostat-2.4; pkill -9 mongofiles-2.4; pkill -9 mongooplog-2.4; pkill -9 mongotop-2.4; pkill -9 resmoke.py; pkill -9 python; pkill -9 cl; pkill -9 lldb; pkill -9 _test} >/dev/null 2>&1
+        exit 0
+  - command: archive.targz_pack
+    params:
+      target: "mongo-coredumps.tgz"
+      source_dir: "./"
+      include:
+        - "./**.mdmp"
+  - command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: mongo-coredumps.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/coredumps/mongo-coredumps-${build_id}-${task_name}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: Core Dumps - Execution ${execution}
+      optional: true
+  - command: shell.cleanup
+
+timeout:
+  - command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        echo "Calling the hang analyzer..."
+        PATH=/opt/mongodbtoolchain/bin:$PATH python buildscripts/hang_analyzer.py
+
+#######################################
+#               Tasks                 #
+#######################################
+
+tasks:
+
+## compile ##
+- name: compile
+  depends_on: []
+  commands:
+    - command: manifest.load
+    - command: git.get_project
+      params:
+        directory: src
+        revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
+          enterprise: ${enterprise_rev}
+          rocksdb: ${rocksdb_rev}
+    - command: git.apply_patch
+      params:
+        directory: src
+    - func: "get buildnumber"
+    - func: "setup credentials"
+    - func: "build new tools" # noop if ${newtools} is not "true"
+    - func: "build rocksdb" # noop if ${build_rocksdb} is not "true"
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+
+          rm -rf ${install_directory|/data/mongo-install-directory}
+          ${scons|scons} ${compile_flags|} --use-new-tools all dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|}
+
+          ${python|python} buildscripts/generate_compile_expansions.py version.json | \
+            tee compile_expansions.yml
+
+          mv mongodb-src-*.${ext|tgz} distsrc.${ext|tgz}
+          mv mongodb-*-debugsymbols.${ext|tgz} mongo-debugsymbols.tgz || true
+          mv mongodb-*.${ext|tgz} mongodb-binaries.tgz
+
+          # If strip is on the path (everywhere except windows) then we should strip the unit test binaries
+          # before tarring them up
+          if [ -x ${strip_path|/usr/bin/strip} ]; then
+            cat build/unittests.txt | xargs ${strip_command|/usr/bin/strip}
+          fi
+
+          # On windows we need to make sure the paths in unittests.txt are compatible with cygwin tar
+          sed 's|\\|/|g' build/unittests.txt > build/unittests-tarlist.txt
+          ${tar|tar} -czvf mongodb-unittests.tgz -T build/unittests-tarlist.txt build/unittests.txt
+    - command: expansions.update
+      params:
+        file: src/compile_expansions.yml
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          if [ "${has_packages|}" = "true" ] ; then
+            cd buildscripts
+            ${python|python} ${packager_script} --prefix `pwd`/.. --distros ${packager_distro} --tarball `pwd`/../mongodb-binaries.tgz -s ${version} -m HEAD
+            cd ..
+          fi
+    - command: archive.targz_pack
+      params:
+        target: "artifacts.tgz"
+        source_dir: "src"
+        include:
+          - "src/mongo/db/modules/enterprise/jstests/**"
+          - "compile_expansions.yml"
+          - "src/mongo/db/modules/subscription/jstests/**"
+          - "src/mongo/db/modules/enterprise/docs/**"
+          - "*.exe"
+          - "jstests/**"
+          - "./test*"
+          - "./dbtest*"
+          - "./mongobridge*"
+          - "buildscripts/**"
+          - "*Example"
+          - "*Test"
+          - "./**.pdb"
+          - "./**.msi"
+          - "./etc/*san.suppressions"
+          - "./build/integration_tests/**"
+          - "./build/integration_tests.txt"
+          - "repo/**"
+          - "src/mongo/util/options_parser/test_config_files/**"
+        exclude_files:
+          - "*_test.pdb"
+    - func: "upload debugsymbols"
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-binaries.tgz
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/binaries/mongo-${build_id}.${ext|tgz}
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        display_name: Binaries
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: artifacts.tgz
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/artifacts/${build_id}.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+        display_name: Artifacts
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-unittests.tgz
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/unittests/${build_id}.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        display_name: Unit tests (stripped)
+
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/distsrc.${ext|tgz}
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        display_name: Source tarball
+        # We only need to upload the source tarball from one of the build variants
+        # because it should be the same everywhere, so just use linux-64/windows-64-2k8.
+        build_variants: [ linux-64, windows-64-2k8 ]
+
+## lint ##
+- name: lint
+  depends_on: []
+  commands:
+    - command: manifest.load
+    - command: git.get_project
+      params:
+        directory: src
+        revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
+          enterprise: ${enterprise_rev}
+          rocksdb: ${rocksdb_rev}
+    - command: git.apply_patch
+      params:
+        directory: src
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+          ${scons|scons} ${compile_flags|} lint
+
+## jstestfuzz ##
+- name: jstestfuzz
+  exec_timeout_secs: 7200 # Time out the task if it runs for more than 2 hours.
+  depends_on:
+  - name: compile
+  commands:
+    - func: "do setup"
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+
+          git clone git@github.com:10gen/jstestfuzz.git
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+          if [ "Windows_NT" != "$OS" ]; then
+            curl --silent --max-time 600 http://boxes.10gen.com/build/node-v0.12.7-linux-x64.tar.gz --output node.tar.gz
+            ${decompress} node.tar.gz
+          fi
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+
+          cp mongodb*/bin/mongod .
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src/jstestfuzz
+        script: |
+          set -o errexit
+          set -o verbose
+
+          if [ "Windows_NT" = "$OS" ]; then
+            # An "npm" directory might not have been created in %APPDATA% by the Windows installer.
+            # Work around the issue by specifying a different %APPDATA% path.
+            # See: https://github.com/nodejs/node-v0.x-archive/issues/8141
+            export APPDATA=${workdir}/npm-app-data
+            export PATH="$PATH:/cygdrive/c/Program Files (x86)/nodejs"
+          else
+            export PATH="$PATH:${workdir}/src/node-v0.12.7-linux-x64/bin"
+          fi
+
+          # Create an output directory for the generated test cases and ensure it always contains at least one JS file
+          # for resmoke to run so that glob expansion cannot result in an error.
+          mkdir -p out
+          touch out/dummy.js
+
+          npm install || true
+          npm start -- --jsTestsDir ../jstests || true
+    - command: archive.targz_pack
+      params:
+        target: "jstests.tgz"
+        source_dir: "src/jstestfuzz"
+        include:
+          - "out/*.js"
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: jstests.tgz
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/jstestfuzz/jstestfuzz-${build_id}-${execution}.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        display_name: Generated Tests - Execution ${execution}
+    - func: "run tests"
+      # Terminate the function when there has been no output to stdout for 30 minutes. E.g. when something is stuck in an infinite loop.
+      # resmoke.py writes the test output to logkeeper and only writes to stdout when starting the next test.
+      # resmoke.py not producing output on stdout means that the test is still running and presumably not going to finish.
+      # Note that timeout_secs is different from exec_timeout_secs, which applies to a task and times out regardless of whether output has been written to stdout.
+      timeout_secs: 1800
+      vars:
+        resmoke_args: --suites=jstestfuzz
+
+## unit tests ##
+- <<: *task_template
+  name: unittests
+  commands:
+  - func: "do setup"
+  - command: s3.get
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/unittests/${build_id}.tgz
+      bucket: mciuploads
+      extract_to: src
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=unittests
+      run_multiple_jobs: true
+
+## integration test suites ##
+
+- <<: *task_template
+  name: aggregation
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=aggregation --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: aggregation_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=aggregation --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: aggregation_auth
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=aggregation_auth
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: audit
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=audit --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: audit_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=audit --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: auth
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=auth --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: auth_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=auth --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: auth_audit
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=auth_audit --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: auth_audit_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=auth_audit --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: dbtest
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=dbtest --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: dbtest_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=dbtest --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: disk
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=disk
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: durability
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=durability
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: dur_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=dur_jscore_passthrough
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: ese_WT
+  commands:
+  - func: "do setup"
+  - func: "set up virtualenv"
+  - command: shell.exec
+    type: test
+    params:
+      working_dir: src
+      script: |
+        set -o errexit
+        set -o verbose
+
+        if [ "Windows_NT" = "$OS" ]; then
+          . ./venv/Scripts/activate
+        else
+          . ./venv/bin/activate
+        fi
+        # we should go back to using pip when it works on SLES
+        easy_install --upgrade `cat src/mongo/db/modules/enterprise/jstests/encryptdb/libs/requirements.txt`
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=ese --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: failpoints
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=failpoints
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: failpoints_auth
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=failpoints_auth
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: gle_auth
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=gle_auth --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: gle_auth_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=gle_auth --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: gle_auth_write_cmd
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args:  --suites=gle_auth --shellWriteMode=commands --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: gle_auth_write_cmd_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=gle_auth --shellWriteMode=commands --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: gle_auth_basics_passthrough
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: gle_auth_basics_passthrough_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: gle_auth_basics_passthrough_write_cmd
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=commands --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: gle_auth_basics_passthrough_write_cmd_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=gle_auth_basics_passthrough --shellWriteMode=commands --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: httpinterface
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=httpinterface
+
+- <<: *task_template
+  name: integration_tests_standalone
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=integration_tests_standalone
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: integration_tests_replset
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=integration_tests_replset
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_gle_auth_basics_passthrough
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_gle_auth_basics_passthrough_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=legacy --shellReadMode=legacy --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_gle_auth_basics_passthrough_write_cmd
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=commands --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_gle_auth_basics_passthrough_write_cmd_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_gle_auth_basics_passthrough --shellWriteMode=commands --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsCore_WT_ese
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core_ese --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsCore_compatibility
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsCore_compatibility_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsCore_auth
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core_auth
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsCore_op_query
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core_op_query --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsCore_op_query_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core_op_query --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: ephemeralForTest
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core --storageEngine=ephemeralForTest
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsCore_small_oplog
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core_small_oplog --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsCore_small_oplog_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core_small_oplog --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsCore_small_oplog_rs
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core_small_oplog_rs --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsCore_small_oplog_rs_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core_small_oplog_rs --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: mongosTest
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=mongos_test
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: mmap
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=mmap
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: multiversion
+  commands:
+  - func: "do setup"
+  - command: shell.exec
+    type: test
+    params:
+      working_dir: src
+      script: |
+        set -o errexit
+        set -o verbose
+
+        cp mongodb*/bin/* .
+        rm -rf /data/install /data/multiversion
+        ${python|python} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion "Linux/x86_64" "1.8" "2.0" "2.2" "2.4" "2.6" "3.0"
+        PATH=$PATH:/data/multiversion ${asan_symbolizer} ${enable_lsan} ${python|python} buildscripts/resmoke.py --suites=multiversion --jobs ${num_jobs_available|1} --shuffle ${test_flags} --log=buildlogger --reportFile=report.json
+
+- <<: *task_template
+  name: noPassthrough
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=no_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: noPassthrough_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=no_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: noPassthroughWithMongod
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=no_passthrough_with_mongod --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: noPassthroughWithMongod_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=no_passthrough_with_mongod --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: bulk_gle_passthrough
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=bulk_gle_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: bulk_gle_passthrough_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=bulk_gle_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: slow1
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=slow1 --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: slow1_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=slow1 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: slow2
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=slow2 --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: slow2_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=slow2 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharded_collections_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharded_collections_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharded_collections_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharded_collections_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_jscore_passthrough_wire_ops_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_jscore_passthrough --storageEngine=wiredTiger --shellReadMode=legacy --shellWriteMode=compatibility
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: parallel
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=parallel --storageEngine=mmapv1
+
+- <<: *task_template
+  name: parallel_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=parallel --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: parallel_compatibility
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=parallel --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=mmapv1
+
+- <<: *task_template
+  name: parallel_compatibility_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=parallel --shellReadMode=legacy --shellWriteMode=compatibility --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: concurrency
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency --storageEngine=mmapv1
+
+- <<: *task_template
+  name: concurrency_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: concurrency_replication
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_replication --storageEngine=mmapv1
+
+- <<: *task_template
+  name: concurrency_replication_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_replication --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: concurrency_sharded
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_sharded --storageEngine=mmapv1
+
+- <<: *task_template
+  name: concurrency_sharded_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_sharded --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: rlp
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=rlp --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: rlp_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=rlp --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: read_concern_majority_passthrough_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=read_concern_majority_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replicasets
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets --storageEngine=mmapv1
+      run_multiple_jobs: true
+      max_jobs: 2
+
+- <<: *task_template
+  name: replicasets_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets --storageEngine=wiredTiger
+      run_multiple_jobs: true
+      max_jobs: 2
+
+- <<: *task_template
+  name: replicasets_WT_ese
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_ese --storageEngine=wiredTiger
+      run_multiple_jobs: true
+      max_jobs: 2
+
+- <<: *task_template
+  name: replicasets_auth
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_auth
+      run_multiple_jobs: true
+      max_jobs: 2
+
+- <<: *task_template
+  name: replicasets_legacy
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_legacy
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replication
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replication --storageEngine=mmapv1
+      run_multiple_jobs: true
+      max_jobs: 2
+
+- <<: *task_template
+  name: replication_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replication --storageEngine=wiredTiger
+      run_multiple_jobs: true
+      max_jobs: 2
+
+- <<: *task_template
+  name: replication_auth
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replication_auth
+      run_multiple_jobs: true
+      max_jobs: 2
+
+- <<: *task_template
+  name: sasl
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sasl
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding --storageEngine=mmapv1
+      run_multiple_jobs: true
+      max_jobs: 2
+
+- <<: *task_template
+  name: sharding_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding --storageEngine=wiredTiger
+      run_multiple_jobs: true
+      max_jobs: 2
+
+- <<: *task_template
+  name: sharding_WT_ese
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese --storageEngine=wiredTiger
+      run_multiple_jobs: true
+      max_jobs: 2
+
+- <<: *task_template
+  name: sharding_auth
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth
+      run_multiple_jobs: true
+      max_jobs: 2
+
+- <<: *task_template
+  name: sharding_auth_audit_WT
+  depends_on:
+  - name: sharding_auth
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit --storageEngine=wiredTiger
+      run_multiple_jobs: true
+      max_jobs: 2
+
+- <<: *task_template
+  name: sharding_legacy
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_legacy
+      run_multiple_jobs: true
+      max_jobs: 2
+
+- <<: *task_template
+  name: snmp
+  commands:
+  - func: "do setup"
+  - command: shell.exec
+    type: test
+    params:
+      working_dir: src
+      script: |
+        set -o errexit
+        set -o verbose
+
+        cp mongodb*/bin/* .
+        mkdir -p snmpconf
+        cp -f src/mongo/db/modules/enterprise/docs/mongod.conf.master snmpconf/mongod.conf
+        SNMPCONFPATH=snmpconf ${asan_symbolizer} ${enable_lsan} ${python|python} buildscripts/resmoke.py --suites=snmp --jobs ${num_jobs_available|1} --shuffle --storageEngine=mmapv1 ${test_flags} --log=buildlogger --reportFile=report.json
+
+- <<: *task_template
+  name: snmp_WT
+  commands:
+  - func: "do setup"
+  - command: shell.exec
+    type: test
+    params:
+      working_dir: src
+      script: |
+        set -o errexit
+        set -o verbose
+
+        cp mongodb*/bin/* .
+        mkdir -p snmpconf
+        cp -f src/mongo/db/modules/enterprise/docs/mongod.conf.master snmpconf/mongod.conf
+        SNMPCONFPATH=snmpconf ${asan_symbolizer} ${enable_lsan} ${python|python} buildscripts/resmoke.py --suites=snmp --jobs ${num_jobs_available|1} --shuffle --storageEngine=wiredTiger ${test_flags} --log=buildlogger --reportFile=report.json
+
+- <<: *task_template
+  name: ssl
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=ssl
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sslSpecial
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=ssl_special
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: tool
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=tool --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: tool_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=tool --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsDecimalCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=decimal
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsDecimalCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=decimal --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- name: push
+  depends_on:
+  - name: "*"
+  stepback: false
+  commands:
+    - func: "fetch artifacts"
+    - func: "fetch binaries"
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: mongodb-mongo-master/${build_variant}/${revision}/sources/mongo-src-${build_id}.${ext|tgz}
+        bucket: mciuploads
+        local_file: src/distsrc.${ext|tgz}
+        build_variants: [ linux-64, windows-64-2k8 ]
+    - command: expansions.update
+      params:
+        file: src/compile_expansions.yml
+    - func: "fetch debugsymbols archive"
+    - command: shell.exec
+      params:
+        working_dir: src
+        silent: true
+        script: |
+          set -o errexit
+          echo "${signing_auth_token}" > signing_auth_token
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+          mv mongo-binaries.tgz mongodb-binaries.${ext|tgz}
+          mv mongo-debugsymbols.tgz debugsymbols-*.${ext|tgz} || true
+          cp mongodb-*.${ext|tgz} mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+          cp debugsymbols-*.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} || true
+          mv distsrc.${ext|tgz} mongodb-src-${src_suffix}.${ext|tar.gz} || true
+          /usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-win32-${push_arch}-${suffix}.msi || true
+
+          notary-client.py --key-name "${signing_key_name}" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
+
+          if [ "${has_packages|}" = "true" ] ; then
+            for rpm in $(find repo/ -name \*.rpm) ; do
+              pushd $(dirname $rpm)
+              # Use --package-file-suffix "" to overwrite existing RPM's instead of saving new "-signed.rpm" RPM files
+              #
+              notary-client.py --key-name "${signing_key_name}" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --archive-file-ext gpg --outputs sig --package-file-suffix "" $(basename $rpm)
+              popd
+            done
+            for release_file in $(find repo/ -name Release) ; do
+              pushd $(dirname $release_file)
+              notary-client.py --key-name "${signing_key_name}" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --outputs sig Release
+              popd
+            done
+          fi
+          tar zcvf repo-${push_arch}.tgz repo || true
+          rm signing_auth_token
+
+    # Put the binaries tarball/zipfile
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}
+    # Put the source tarball
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-src-${src_suffix}.${ext|tar.gz}
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}
+        build_variants: [ linux-64, windows-64-2k8 ]
+
+    # Put the debug symbols
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        aws_key: ${aws_key}
+        build_variants: *debug_symbol_variants
+        permissions: public-read
+        local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}
+        bucket: build-push-testing
+        content_type: ${content_type|application/x-gzip}
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}
+
+    # Put the binaries tarball signature
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig
+
+    # Put the source tarball signature
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-src-${src_suffix}.${ext|tar.gz}.sig
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sig
+        build_variants: [ linux-64, windows-64-2k8 ]
+
+    # Put the debug symbols signature
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        aws_key: ${aws_key}
+        build_variants: *debug_symbol_variants
+        permissions: public-read
+        local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sig
+        bucket: build-push-testing
+        content_type: ${content_type|application/x-gzip}
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sig
+
+    # Put the signed MSI file
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        permissions: public-read
+        build_variants: ["enterprise-windows-64", "windows-64", "windows-64-2k8", "windows-64-2k8-ssl", "windows-32"]
+        local_file: src/mongodb-win32-${push_arch}-${suffix}-signed.msi
+        bucket: build-push-testing
+        content_type: application/x-msi
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi
+
+    # Put the binaries tarball sha1
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1
+        aws_key: ${aws_key}
+        permissions: public-read
+        bucket: build-push-testing
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1
+
+    # Put the source tarball sha1
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-src-${src_suffix}.${ext|tar.gz}.sha1
+        aws_key: ${aws_key}
+        permissions: public-read
+        bucket: build-push-testing
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha1
+        build_variants: [ linux-64, windows-64-2k8 ]
+
+    # Put the debug symbols sha1
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        aws_key: ${aws_key}
+        build_variants: *debug_symbol_variants
+        permissions: public-read
+        local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha1
+        bucket: build-push-testing
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha1
+
+    # Push the signed MSI sha1
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        permissions: public-read
+        build_variants: ["enterprise-windows-64", "windows-64", "windows-64-2k8", "windows-64-2k8-ssl", "windows-32"]
+        local_file: src/mongodb-win32-${push_arch}-${suffix}-signed.msi.sha1
+        bucket: build-push-testing
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.sha1
+
+    # Put the binaries tarball sha256
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256
+        permissions: public-read
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256
+
+    # Put the source tarball sha256
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-src-${src_suffix}.${ext|tar.gz}.sha256
+        permissions: public-read
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha256
+        build_variants: [ linux-64, windows-64-2k8 ]
+
+    # Put the debug symbols sha256
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        build_variants: *debug_symbol_variants
+        local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha256
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha256
+
+    # Put the signed MSI sha256
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        build_variants: ["enterprise-windows-64", "windows-64", "windows-64-2k8", "windows-64-2k8-ssl", "windows-32"]
+        local_file: src/mongodb-win32-${push_arch}-${suffix}-signed.msi.sha256
+        bucket: build-push-testing
+        permissions: public-read
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.sha256
+        content_type: text/plain
+
+    # Put the binaries tarball md5
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5
+
+    # Put the source tarball md5
+    - command: s3.put
+      params:
+        aws_secret: ${aws_secret}
+        local_file: src/mongodb-src-${src_suffix}.${ext|tar.gz}.md5
+        aws_key: ${aws_key}
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.md5
+        build_variants: [ linux-64, windows-64-2k8 ]
+
+    # Put the debug symbols md5
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        build_variants: *debug_symbol_variants
+        local_file: src/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.md5
+        bucket: build-push-testing
+        content_type: text/plain
+        permissions: public-read
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.md5
+
+    # Put the signed MSI md5
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        build_variants: ["enterprise-windows-64", "windows-64", "windows-64-2k8", "windows-64-2k8-ssl", "windows-32"]
+        local_file: src/mongodb-win32-${push_arch}-${suffix}-signed.msi.md5
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: text/plain
+        remote_file: ${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.md5
+
+    # Put the tarred up Package repo
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        build_variants: *packaging_variants
+        local_file: src/repo-${push_arch}.tgz
+        bucket: build-push-testing
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+        remote_file: ${push_path}-STAGE/${push_name}/repo-${push_arch}-${task_id}.tgz
+
+    - command: s3Copy.copy
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        s3_copy_files:
+            #Package repo tarballs
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/repo-${push_arch}-${task_id}.tgz', 'bucket': 'build-push-testing'},
+               'destination': {'path': 'packages/repo-${push_arch}-${suffix}.tgz', 'bucket': '${push_bucket}'},
+                build_variants: *packaging_variants
+                 }
+
+            #Binaries
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'}}
+
+            #Source tarball
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}', 'bucket': 'build-push-testing'},
+               'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}', 'bucket': '${push_bucket}'},
+               'build_variants': [ 'linux-64', 'windows-64-2k8' ]
+            }
+
+            #Debug Symbols
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}', 'bucket': '${push_bucket}'},
+               'build_variants': *debug_symbol_variants
+              }
+
+            #MSI (Windows only)
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi', 'bucket': '${push_bucket}'},
+               'build_variants': [ 'enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl', 'windows-32' ] }
+
+            #Binaries Signature
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sig', 'bucket': '${push_bucket}'}}
+
+            #Debug Symbols Signature
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sig', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sig', 'bucket': '${push_bucket}'},
+               'build_variants': *debug_symbol_variants
+              }
+
+            #Source tarball signature
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sig', 'bucket': 'build-push-testing'},
+               'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.sig', 'bucket': '${push_bucket}'},
+               'build_variants': [ 'linux-64', 'windows-64-2k8' ]
+            }
+
+            #SHA1 for binaries
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'}}
+
+            #SHA1 for source tarball
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha1', 'bucket': 'build-push-testing'},
+               'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.sha1', 'bucket': '${push_bucket}'},
+               'build_variants': [ 'linux-64', 'windows-64-2k8' ]
+            }
+
+            #SHA1 for debug symbols
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha1', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha1', 'bucket': '${push_bucket}'},
+               'build_variants': *debug_symbol_variants
+              }
+
+            #SHA1 for MSI
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.sha1', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi.sha1', 'bucket': '${push_bucket}'},
+               'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl', 'windows-32'] }
+
+            #SHA256 for binaries
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'}}
+
+            #SHA256 for source tarball
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.sha256', 'bucket': 'build-push-testing'},
+               'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.sha256', 'bucket': '${push_bucket}'},
+               'build_variants': [ 'linux-64', 'windows-64-2k8' ]
+            }
+
+            #SHA256 for debugsymbols
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.sha256', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.sha256', 'bucket': '${push_bucket}'},
+               'build_variants': *debug_symbol_variants}
+
+            #SHA256 for MSI files
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.sha256', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi.sha256', 'bucket': '${push_bucket}'},
+               'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl', 'windows-32'], }
+
+
+            #MD5 for binaries
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'}}
+
+            #MD5 for source tarball
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-src-${src_suffix}-${task_id}.${ext|tar.gz}.md5', 'bucket': 'build-push-testing'},
+               'destination': {'path': 'src/mongodb-src-${src_suffix}.${ext|tar.gz}.md5', 'bucket': '${push_bucket}'},
+               'build_variants': [ 'linux-64', 'windows-64-2k8' ]
+            }
+
+            #MD5 for debugsymbols
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'},
+               'build_variants': *debug_symbol_variants
+                }
+
+            #MD5 for MSIs
+            - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-win32-${push_arch}-${suffix}-${task_id}-signed.msi.md5', 'bucket': 'build-push-testing'},
+               'destination': {'path': '${push_path}/mongodb-win32-${push_arch}-${suffix}-signed.msi.md5', 'bucket': '${push_bucket}'},
+               'build_variants': ['enterprise-windows-64', 'windows-64', 'windows-64-2k8', 'windows-64-2k8-ssl', 'windows-32'], }
+
+- name: jira_versions
+  depends_on:
+    - name: push
+      variant: linux-64
+  stepback: false
+  commands:
+    - func: "clone kernel-tools repo"
+    - func: "setup release credentials"
+    - func: "setup kernel-tools virtualenv"
+    - command: shell.exec
+      params:
+        working_dir: "kernel-tools/releases/release_tickets"
+        script: |
+          set -o errexit
+          set -o verbose
+
+          . venv-release/bin/activate
+
+          python release_fixversion.py ${version}
+          python create_fixversion.py ${version}
+          python make_ticket.py --execute --version ${version} --ticket deploy
+    - func: "cleanup release credentials"
+
+- name: docs_ticket
+  depends_on:
+    - name: push
+      variant: "*"
+  stepback: false
+  commands:
+    - func: "clone kernel-tools repo"
+    - func: "setup release credentials"
+    - func: "setup kernel-tools virtualenv"
+    - command: shell.exec
+      working_dir: "kernel-tools/releases/release_tickets"
+      params:
+        script: |
+          set -o errexit
+          set -o verbose
+
+          . venv-release/bin/activate
+
+          python make_ticket.py --execute --version ${version} --assignee ${release_notes_maintainer} --ticket docs
+    - func: "cleanup release credentials"
+
+#######################################
+#               Modules               #
+#######################################
+# if a module is added and to be added to the manifest
+# be sure to add the module to git.get_project revisions parameter
+modules:
+- name: enterprise
+  repo: git@github.com:10gen/mongo-enterprise-modules.git
+  prefix: src/mongo/db/modules
+  branch: master
+
+- name: rocksdb
+  repo: git@github.com:mongodb-partners/mongo-rocks.git
+  prefix: src/mongo/db/modules
+  branch: master
+
+#######################################
+#            Buildvariants            #
+#######################################
+
+buildvariants:
+
+###########################################
+#         Linux buildvariants             #
+###########################################
+
+
+- name: rhel70
+  display_name: SSL RHEL 7.0
+  modules: ~
+  run_on:
+  - rhel70
+  batchtime: 1440 # 1 day
+  expansions:
+    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
+    tooltags: "-tags ssl"
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux
+    push_arch: x86_64-rhel70
+    compile_flags: --ssl MONGO_DISTMOD=rhel70 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    test_flags: --continueOnFailure
+    has_packages: true
+    packager_script: packager.py
+    packager_distro: rhel70
+  tasks:
+  - name: compile
+    distros:
+    - rhel70
+  - name: aggregation
+  - name: aggregation_WT
+  - name: aggregation_auth
+  - name: auth
+  - name: auth_WT
+  - name: dbtest
+  - name: dbtest_WT
+  - name: disk
+  - name: durability
+  - name: dur_jscore_passthrough
+  - name: failpoints
+  - name: failpoints_auth
+  - name: gle_auth
+  - name: gle_auth_WT
+  - name: gle_auth_write_cmd
+  - name: gle_auth_write_cmd_WT
+  - name: gle_auth_basics_passthrough
+  - name: gle_auth_basics_passthrough_WT
+  - name: gle_auth_basics_passthrough_write_cmd
+  - name: gle_auth_basics_passthrough_write_cmd_WT
+  - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_WT
+  - name: sharding_gle_auth_basics_passthrough_write_cmd
+  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
+  - name: jsCore
+  - name: jsCore_WT
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jsCore_compatibility_WT
+  - name: jsCore_small_oplog
+  - name: jsCore_small_oplog_WT
+  - name: jsCore_small_oplog_rs
+  - name: jsCore_small_oplog_rs_WT
+  - name: jstestfuzz
+  - name: mmap
+  - name: mongosTest
+  - name: multiversion
+  - name: noPassthrough
+  - name: noPassthrough_WT
+  - name: noPassthroughWithMongod
+  - name: noPassthroughWithMongod_WT
+  - name: bulk_gle_passthrough
+  - name: bulk_gle_passthrough_WT
+  - name: parallel
+  - name: parallel_WT
+  - name: parallel_compatibility
+  - name: parallel_compatibility_WT
+  - name: concurrency
+  - name: concurrency_WT
+  - name: concurrency_replication
+  - name: concurrency_replication_WT
+  - name: concurrency_sharded
+  - name: concurrency_sharded_WT
+  - name: replicasets
+  - name: replicasets_WT
+  - name: replicasets_auth
+  - name: replication
+  - name: replication_WT
+  - name: replication_auth
+  - name: sharding
+  - name: sharding_WT
+  - name: sharding_auth
+  - name: slow1
+  - name: slow1_WT
+  - name: slow2
+  - name: slow2_WT
+  - name: sharding_jscore_passthrough
+  - name: sharding_jscore_passthrough_WT
+  - name: ssl
+  - name: sslSpecial
+  - name: tool
+  - name: tool_WT
+  - name: unittests
+  - name: push
+    distros:
+    - rhel55-test
+
+###########################################
+#          Ubuntu buildvariants           #
+###########################################
+
+
+##############################################
+# mongo-partner storage engine buildvariants #
+##############################################
+
+#
+#- name: release
+#  display_name: ~~ Release Process
+#  modules: ~
+#  run_on:
+#  - ubuntu1404-docker
+#  tasks:
+#  - name: jira_versions
+#  - name: docs_ticket
