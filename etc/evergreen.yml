@@ -19,10 +19,10 @@
 # - 'build_variant' (references the executing task's buildvariant).
 # - 'config_root' (references the root directory for the executor's configuration artifacts).
 
-user: "admin"
-api_key: "f7d9e4387a80283880b7a01c9512adc5"
-api_server_host: "http://soe05x-vm1.aus.stglabs.ibm.com:8080/api"
-ui_server_host: "http://soe05x-vm1.aus.stglabs.ibm.com:9090"
+#user: "admin"
+#api_key: "f7d9e4387a80283880b7a01c9512adc5"
+#api_server_host: "http://soe05x-vm1.aus.stglabs.ibm.com:8080/api"
+#ui_server_host: "http://soe05x-vm1.aus.stglabs.ibm.com:9090"
 
 stepback: true
 command_type: system
